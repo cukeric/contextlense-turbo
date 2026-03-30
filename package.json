@@ -1,0 +1,55 @@
+{
+  "name": "@cukeric/contextlens-turbo",
+  "version": "1.0.0",
+  "description": "3-bit semantic MCP server — TurboQuant-compressed vector search + FTS5 hybrid retrieval for AI coding assistants",
+  "author": "Davor Cukeric <davor@cukeric.com> (https://davor.cukeric.com)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/cukeric/contextlens-turbo.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "semantic-search",
+    "vector-search",
+    "turbo-quant",
+    "polar-quant",
+    "tree-sitter",
+    "code-indexer",
+    "token-efficient",
+    "claude-code",
+    "ai-coding"
+  ],
+  "type": "module",
+  "bin": {
+    "contextlens-turbo": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "grammars"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.3.3",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.1",
+    "web-tree-sitter": "^0.25.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
