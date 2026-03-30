@@ -20,18 +20,26 @@ The original ContextLens retrieves code precisely. **Turbo understands what you 
 
 ## ContextLens vs ContextLens Turbo
 
-> **Short answer:** same 7 tools, same token efficiency — Turbo adds a semantic brain.
+```mermaid
+flowchart LR
+    Q["🔎 query:\n'timestamp formatter'"]
 
-```
-                    ContextLens              ContextLens Turbo
-                    ───────────              ─────────────────
+    subgraph CL["ContextLens"]
+        KW1["FTS5 keyword\nmatch"]
+        R1["❌ 0 results\nno keyword overlap"]
+    end
 
-Query: "format timestamps"
+    subgraph CT["ContextLens Turbo"]
+        KW2["FTS5 keyword\nmatch"]
+        SEM["384-dim\nvector similarity"]
+        RRF["Reciprocal\nRank Fusion"]
+        R2["✅ toISOString\n✅ parseDate\n✅ formatRelative\n✅ dateUtils"]
+    end
 
-  Keyword match:   formatTimestamp ✓         formatTimestamp ✓
-  Semantic match:  ✗ (not found)             toISOString     ✓
-                                             parseDate       ✓
-                                             dateUtils       ✓
+    Q --> CL
+    Q --> CT
+    KW1 --> R1
+    KW2 & SEM --> RRF --> R2
 ```
 
 | Capability | ContextLens | ContextLens Turbo |
@@ -44,79 +52,165 @@ Query: "format timestamps"
 | **Semantic context neighbors** | ✗ | ✅ |
 | Offline — no API keys | ✅ | ✅ |
 | Graceful FTS5 fallback | N/A | ✅ |
-| Storage per indexed symbol | 0 bytes (vectors) | ~224 bytes |
-| Embedding model | None | `all-MiniLM-L6-v2` (offline ONNX) |
+| Storage per indexed symbol | 0 bytes | ~224 bytes |
+| Embedding model | None | `all-MiniLM-L6-v2` (ONNX, offline) |
 
 ---
 
-## The Problem ContextLens Couldn't Solve
+## Architecture
 
-ContextLens is great at finding `formatDate` when you search `format`. It fails when your vocabulary doesn't match the source code:
+```mermaid
+flowchart TD
+    subgraph src["Your Project"]
+        direction LR
+        code["Source Code\n.ts .py .go .rs .js"]
+        docs["Documentation\n.md .rst .txt"]
+    end
 
+    subgraph parse["Parse Layer"]
+        ast["tree-sitter AST"]
+        docp["Heading Hierarchy"]
+    end
+
+    subgraph embed["Semantic Layer"]
+        model["all-MiniLM-L6-v2\n384-dim · ONNX · offline\n~23MB download once"]
+        tq["TurboQuant Compression\nPolarQuant + QJL\n1,536 bytes → 224 bytes"]
+    end
+
+    subgraph store["SQLite Index"]
+        sym["Symbols + Sections"]
+        fts["FTS5 Index"]
+        vec["Vector Index\n~224 bytes / symbol"]
+    end
+
+    subgraph search["Search Pipeline"]
+        kw["Keyword Search\nFTS5 + trigram"]
+        sem["Semantic Search\ncosine similarity"]
+        rrf["Reciprocal Rank Fusion\nscore = 1÷(60+kw) + 1÷(60+sem)"]
+    end
+
+    agent["🤖 AI Agent"]
+
+    code --> ast --> sym & fts
+    docs --> docp --> sym
+    ast & docp --> model --> tq --> vec
+
+    sym --> store
+    fts --> store
+    vec --> store
+
+    agent -->|query| kw & sem
+    kw & sem --> rrf
+    rrf -->|ranked results| agent
 ```
-You search:    "timestamp formatter"
-Code has:      function toISOString(date: Date) { ... }
-
-ContextLens:   0 results  ← keyword mismatch
-Turbo:         toISOString, parseDate, formatRelative, ...  ← semantic match
-```
-
-**ContextLens Turbo embeds both your query and the codebase into the same 384-dimensional vector space**, then ranks results by meaning — not just string overlap. Keyword search remains as a parallel signal, merged via Reciprocal Rank Fusion.
 
 ---
 
-## How It Works
+## TurboQuant Compression Pipeline
 
-```
-                        INDEX PIPELINE
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  Source file  →  tree-sitter AST  →  symbol text   │
-  │                                          ↓          │
-  │                               all-MiniLM-L6-v2      │
-  │                               (384-dim, ONNX/WASM)  │
-  │                                          ↓          │
-  │                             TurboQuant compression  │
-  │                          PolarQuant (3-bit angles)  │
-  │                        + QJL (1-bit residuals)      │
-  │                                          ↓          │
-  │                          ~224 bytes / vector        │
-  │                         (vs 1,536 uncompressed)     │
-  │                          6.9× smaller in SQLite     │
-  └─────────────────────────────────────────────────────┘
+Raw embedding vectors are 1,536 bytes each. TurboQuant compresses them in two stages:
 
-                        SEARCH PIPELINE
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  Query  ──→  FTS5 keyword search  ──→  ranked list  │
-  │    │                                       │        │
-  │    └──→  embed query  ──→  TurboQuant  ──→ │        │
-  │               cosine similarity            │        │
-  │                                            ↓        │
-  │               Reciprocal Rank Fusion (RRF)          │
-  │          score = 1/(60+kw_rank) + 1/(60+sem_rank)   │
-  │                                            ↓        │
-  │                        unified result list          │
-  └─────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    IN["float32 vector\n384 dimensions\n1,536 bytes"]
+
+    subgraph pq["Stage 1 — PolarQuant"]
+        direction TB
+        pq1["Recursive polar\ndecomposition"]
+        pq2["3-bit angle\nquantization\n16 bins · ±π/16 error"]
+        pq3["200 bytes"]
+        pq1 --> pq2 --> pq3
+    end
+
+    subgraph qjl["Stage 2 — QJL"]
+        direction TB
+        qjl1["Johnson-Lindenstrauss\nrandom projection\n192 dimensions"]
+        qjl2["1-bit sign\nencoding"]
+        qjl3["24 bytes\nresidual correction"]
+        qjl1 --> qjl2 --> qjl3
+    end
+
+    OUT["Compressed\n224 bytes\n6.9× smaller\n≥ 0.95 cosine fidelity\nPure TypeScript · zero native deps"]
+
+    IN --> pq --> qjl --> OUT
 ```
 
-### TurboQuant Compression
+```mermaid
+pie title Storage per vector
+    "Compressed — TurboQuant (224 bytes)" : 224
+    "Savings vs float32 (1,312 bytes)" : 1312
+```
 
-The semantic magic fits in ~224 bytes per vector through two stages:
+---
 
-| Stage | Algorithm | Output | Ratio |
-|-------|-----------|--------|-------|
-| **PolarQuant** | Recursive polar decomposition, 3-bit angle quantization | 200 bytes | — |
-| **QJL** | Johnson-Lindenstrauss residual, 1-bit sign encoding | 24 bytes | — |
-| **Combined** | PolarQuant + QJL packed | **224 bytes** | **6.9× vs float32** |
+## Hybrid Search Flow
 
-> Round-trip cosine similarity ≥ 0.95. Pure TypeScript — zero native dependencies.
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 AI Agent
+    participant CL as ContextLens Turbo
+    participant FTS as FTS5 Index
+    participant VEC as Vector Index
+    participant RRF as RRF Fusion
+
+    Agent->>CL: search("how do I authenticate users")
+    CL->>FTS: keyword match: "authenticate users"
+    FTS-->>CL: [authMiddleware #3, verifyToken #7, ...]
+
+    CL->>CL: embed query → 384-dim vector → TurboQuant
+    CL->>VEC: cosine similarity scan
+    VEC-->>CL: [getSession #1, requireAuth #2, verifyToken #4, ...]
+
+    CL->>RRF: merge keyword + semantic ranks
+    RRF-->>CL: fused scores
+    CL-->>Agent: getSession · verifyToken · requireAuth · authMiddleware · ...
+```
+
+---
+
+## Index Pipeline
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 AI Agent
+    participant CL as ContextLens Turbo
+    participant DB as SQLite
+
+    Agent->>CL: index()
+    CL->>CL: walk files, hash content
+    CL->>DB: skip unchanged files
+    CL->>CL: tree-sitter AST → extract symbols
+    CL->>CL: embed symbols → TurboQuant compress
+    CL->>DB: store symbols + vectors
+    DB-->>CL: 2,637 symbols · 5.5MB
+    CL-->>Agent: ready in ~20s (cold) / <2s (incremental)
+```
+
+---
+
+## Token Savings
+
+```mermaid
+xychart-beta
+    title "Tokens consumed — Full file read vs ContextLens Turbo"
+    x-axis ["Find function", "Semantic NL search", "Context + neighbors", "Explore codebase"]
+    y-axis "Tokens" 0 --> 45000
+    bar [3200, 15000, 22000, 40000]
+    bar [800, 1400, 4200, 6000]
+```
+
+| Scenario | Full read | ContextLens Turbo | Savings |
+|----------|----------:|:-----------------:|:-------:|
+| Find one function in 800-line file | 3,200 | 800 | **75%** |
+| Semantic search with natural language | 15,000 | 1,400 | **91%** |
+| `context` with semantic neighbors | 22,000 | 4,200 | **81%** |
+| Explore unfamiliar codebase | 40,000+ | 6,000 | **85%** |
 
 ---
 
 ## Tools
 
-Same 7 tools as ContextLens, with `search` and `context` supercharged:
+Same 7 tools as ContextLens — `search` and `context` supercharged:
 
 | Tool | What it does | Turbo enhancement |
 |------|-------------|:-----------------:|
@@ -128,20 +222,25 @@ Same 7 tools as ContextLens, with `search` and `context` supercharged:
 | `context` | Smart bundle — target + related | **Semantic neighbors** |
 | `status` | Index stats, vector count, model state | Vector stats added |
 
-**Tool description overhead: ~1,200 tokens** — same as ContextLens, unchanged.
+**Tool description overhead: ~1,200 tokens** — identical to ContextLens.
 
 ---
 
-## Token Savings
+## Natural Language Search in Practice
 
-Measured on a 26K LOC TypeScript/React project (179 files, 2,348 symbols):
+```
+search("how do I authenticate users")
+  → getSession, verifyToken, authMiddleware, requireAuth
 
-| Scenario | Full file read | ContextLens Turbo | Savings |
-|----------|:------------:|:-----------------:|:-------:|
-| Find one function in 800-line file | 3,200 tokens | 800 tokens | **75%** |
-| Semantic search with natural language | 15,000 tokens | 1,400 tokens | **91%** |
-| `context` with semantic neighbors | 22,000 tokens | 4,200 tokens | **81%** |
-| Explore unfamiliar codebase | 40,000+ tokens | 6,000 tokens | **85%** |
+search("database connection setup")
+  → createPool, initDatabase, connectPrisma
+
+search("format date for display")
+  → formatDate, toRelativeTime, toISOString, dateUtils
+
+search("error boundary handling")
+  → ErrorBoundary, handleError, withErrorBoundary, fallbackUI
+```
 
 ---
 
@@ -181,8 +280,8 @@ npm install -g @cukeric/contextlens-turbo
 ### Option 3 — Local dev
 
 ```bash
-git clone git@github.com:cukeric/contextlens-turbo.git
-cd contextlens-turbo && npm install && npm run build
+git clone git@github.com:cukeric/contextlense-turbo.git
+cd contextlense-turbo && npm install && npm run build
 ```
 
 ```json
@@ -204,9 +303,9 @@ cd contextlens-turbo && npm install && npm run build
 <details>
 <summary><strong>Claude Code</strong></summary>
 
-Add `.mcp.json` to your project root using Option 1. Claude Code reads it automatically.
+Add `.mcp.json` to your project root. Claude Code reads it automatically.
 
-The session-start `index` call will also download and cache the embedding model (~23MB) on first run. Subsequent sessions load it from `~/.contextlens-turbo/models/` in milliseconds.
+The first `index` call downloads and caches the embedding model (~23MB) to `~/.contextlens-turbo/models/`. Subsequent sessions load it in ~200ms.
 
 </details>
 
@@ -255,111 +354,50 @@ Add to `.cursor/mcp.json` or `.windsurf/mcp.json` using the same format as Claud
 
 ---
 
-## Usage
-
-```
-1.  index     →  parse project + generate semantic vectors (~2–5s cold, ~40ms incremental)
-2.  search    →  natural language or keyword — hybrid results ranked by meaning
-3.  get       →  retrieve exactly what's needed (with token budget)
-4.  context   →  target + structural relatives + semantic neighbors
-```
-
-### Natural language search in practice
-
-```
-search("how do I authenticate users")
-  → getSession, verifyToken, authMiddleware, requireAuth, ...
-
-search("database connection setup")
-  → createPool, initDatabase, connectPrisma, ...
-
-search("format date for display")
-  → formatDate, toRelativeTime, toISOString, dateUtils, ...
-```
-
-### Graceful fallback
-
-If the embedding model fails to load (memory constraints, WASM unavailable), all 7 tools continue working via FTS5 keyword search. No crashes. The `status` tool reports whether semantic search is active.
-
----
-
-## Language & Format Support
-
-### Code (tree-sitter AST — all grammars bundled)
-
-| Language | Extensions |
-|----------|-----------|
-| TypeScript / TSX | `.ts` `.tsx` |
-| JavaScript / JSX | `.js` `.jsx` |
-| Python | `.py` |
-| Go | `.go` |
-| Rust | `.rs` |
-
-### Docs (heading hierarchy)
-
-`.md` · `.mdx` · `.rst` · `.txt` · `.adoc`
-
----
-
 ## Performance
-
-Measured on a 26K LOC project (179 files, 2,348 symbols):
 
 | Metric | ContextLens | ContextLens Turbo |
 |--------|:-----------:|:-----------------:|
-| Cold index | 2.2s | ~5–8s (+ embedding) |
-| Incremental index (no changes) | 39ms | ~40ms |
-| Model load (first time) | N/A | ~3s (downloads ~23MB) |
+| Cold index (188-file project) | ~2s | ~20s |
+| Incremental (3–5 changed files) | <100ms | <2s |
+| Model load (first time) | N/A | ~3s + 23MB download |
 | Model load (cached) | N/A | ~200ms |
-| Search latency | ~15ms | ~20ms (hybrid) |
-| DB size | 2.5 MB | ~3.0 MB |
-| Bytes per vector | 0 | ~224 bytes |
+| Search latency | ~15ms | ~20ms |
+| DB size | 2.5 MB | ~5.5 MB |
+| Bytes per vector | 0 | **224 bytes** |
 | Compression ratio | N/A | **6.9:1** |
+
+---
+
+## Which Version Should I Use?
+
+```mermaid
+flowchart TD
+    Q["Which ContextLens?"]
+
+    Q --> A{"Strict memory\nor cold-start\nconstraints?"}
+    A -->|Yes| CL["ContextLens\ngithub.com/cukeric/contextlens"]
+    A -->|No| B{"Codebase has\ninconsistent\nnaming?"}
+    B -->|No| C{"Need natural\nlanguage\nqueries?"}
+    C -->|No| CL
+    C -->|Yes| CT["ContextLens Turbo\ngithub.com/cukeric/contextlense-turbo"]
+    B -->|Yes| CT
+```
+
+Both produce identical MCP tool schemas — swap between them without changing your agent workflow.
 
 ---
 
 ## Limitations
 
-- **First-run model download** — ~23MB ONNX model downloaded to `~/.contextlens-turbo/models/` on first `index` call. Fully cached after that.
-- **No real-time file watching** — index updates when you call `index`, not on file changes.
-- **Single project scope** — one root per instance, indexes from the `.git` root.
-- **Semantic search is approximate** — uses compressed 3-bit vectors. Round-trip cosine similarity ≥ 0.95, not lossless.
-- **Memory** — embedding model holds ~50MB in memory while the server runs.
-
----
-
-## Which version should I use?
-
-| Use ContextLens if... | Use ContextLens Turbo if... |
-|---|---|
-| You need zero cold-start overhead | You want "find anything by meaning" |
-| Your codebase is well-named and consistent | Your codebase has inconsistent naming |
-| You have strict memory constraints | You want semantic `context` bundles |
-| You only need keyword/fuzzy matching | You want natural language queries |
-
-Both produce identical tool schemas — you can swap between them without changing your agent workflow.
-
----
-
-## Prerequisites
-
-- **Node.js 20+** (LTS recommended)
-- Any MCP-compatible coding agent
-- ~100MB disk (model cache)
-- ~100MB memory (model runtime)
-
-### Platform Support
-
-| Platform | Status |
-|----------|--------|
-| macOS (Apple Silicon & Intel) | Fully supported |
-| Linux (x64, arm64) | Fully supported |
-| Windows (x64) | Supported (WSL recommended) |
+- **First-run model download** — ~23MB to `~/.contextlens-turbo/models/`. Fully cached after that.
+- **No real-time file watching** — index updates on `index` calls, not on file changes.
+- **Semantic search is approximate** — ≥0.95 cosine similarity, not lossless.
+- **Memory** — embedding model holds ~50MB while the server runs.
+- **Graceful fallback** — if the model fails to load, all 7 tools continue working via FTS5.
 
 ---
 
 ## License
 
-MIT — Copyright (c) 2026 [Davor Cukeric](https://davor.cukeric.com)
-
-[github.com/cukeric](https://github.com/cukeric)
+MIT — Copyright (c) 2026 [Davor Cukeric](https://davor.cukeric.com) · [github.com/cukeric](https://github.com/cukeric)
